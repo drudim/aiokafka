@@ -4,10 +4,11 @@ import logging
 import random
 from itertools import chain
 
-from kafka.protocol.fetch import FetchRequest
+# from kafka.protocol.fetch import FetchRequest
 from kafka.protocol.message import PartialMessage
 from kafka.protocol.offset import OffsetRequest, OffsetResetStrategy
 
+from aiokafka.record.fetch import FetchRequest
 import aiokafka.errors as Errors
 from aiokafka.errors import (
     ConsumerStoppedError, RecordTooLargeError, KafkaTimeoutError)
@@ -17,6 +18,10 @@ from aiokafka.util import ensure_future, create_future
 log = logging.getLogger(__name__)
 
 UNKNOWN_OFFSET = -1
+
+# Isolation levels
+READ_UNCOMMITTED = 0
+READ_COMMITTED = 1
 
 
 class FetchResult:
@@ -125,6 +130,7 @@ class Fetcher:
                  value_deserializer=None,
                  fetch_min_bytes=1,
                  fetch_max_wait_ms=500,
+                 fetch_max_bytes=52428800,
                  max_partition_fetch_bytes=1048576,
                  check_crcs=True,
                  fetcher_timeout=0.2,
@@ -147,6 +153,15 @@ class Fetcher:
                 the server will block before answering the fetch request if
                 there isn't sufficient data to immediately satisfy the
                 requirement given by fetch_min_bytes. Default: 500.
+            fetch_max_bytes (int): The maximum amount of data the server should
+                return for a fetch request. This is not an absolute maximum, if
+                the first message in the first non-empty partition of the fetch
+                is larger than this value, the message will still be returned
+                to ensure that the consumer can make progress. NOTE: consumer
+                performs fetches to multiple brokers in parallel so memory
+                usage will depend on the number of brokers containing
+                partitions for the topic.
+                Supported Kafka version >= 0.10.1.0. Default: 52428800 (50 Mb).
             max_partition_fetch_bytes (int): The maximum amount of data
                 per-partition the server will return. The maximum total memory
                 used for a request = #partitions * max_partition_fetch_bytes.
@@ -172,12 +187,14 @@ class Fetcher:
         self._value_deserializer = value_deserializer
         self._fetch_min_bytes = fetch_min_bytes
         self._fetch_max_wait_ms = fetch_max_wait_ms
+        self._fetch_max_bytes = fetch_max_bytes
         self._max_partition_fetch_bytes = max_partition_fetch_bytes
         self._check_crcs = check_crcs
         self._fetcher_timeout = fetcher_timeout
         self._prefetch_backoff = prefetch_backoff
         self._retry_backoff = retry_backoff_ms / 1000
         self._subscriptions = subscriptions
+        self._isolation_level = READ_UNCOMMITTED
 
         self._records = collections.OrderedDict()
         self._in_flight = set()
@@ -186,7 +203,14 @@ class Fetcher:
         self._wait_consume_future = None
         self._wait_empty_future = None
 
-        req_version = 2 if client.api_version >= (0, 10) else 1
+        if client.api_version >= (0, 11):
+            req_version = 4
+        elif client.api_version >= (0, 10, 1):
+            req_version = 3
+        elif client.api_version >= (0, 10):
+            req_version = 2
+        else:
+            req_version = 1
         self._fetch_request_class = FetchRequest[req_version]
 
         self._fetch_task = ensure_future(
@@ -341,11 +365,27 @@ class Fetcher:
             if node_id in backoff_by_nodes:
                 # At least one partition is still waiting to be consumed
                 continue
-            req = self._fetch_request_class(
-                -1,  # replica_id
-                self._fetch_max_wait_ms,
-                self._fetch_min_bytes,
-                partition_data)
+            if self._fetch_request_class.API_VERSION <= 2:
+                req = self._fetch_request_class(
+                    -1,  # replica_id
+                    self._fetch_max_wait_ms,
+                    self._fetch_min_bytes,
+                    partition_data)
+            elif self._fetch_request_class.API_VERSION == 3:
+                req = self._fetch_request_class(
+                    -1,  # replica_id
+                    self._fetch_max_wait_ms,
+                    self._fetch_min_bytes,
+                    self._fetch_max_bytes,
+                    partition_data)
+            else:
+                req = self._fetch_request_class(
+                    -1,  # replica_id
+                    self._fetch_max_wait_ms,
+                    self._fetch_min_bytes,
+                    self._fetch_max_bytes,
+                    self._isolation_level,
+                    partition_data)
             requests.append((node_id, req))
         if backoff_by_nodes:
             # Return min time til any node will be ready to send event
@@ -372,7 +412,7 @@ class Fetcher:
                 fetch_offsets[TopicPartition(topic, partition)] = offset
 
         for topic, partitions in response.topics:
-            for partition, error_code, highwater, messages in partitions:
+            for partition, error_code, highwater, _, _, records in partitions:
                 tp = TopicPartition(topic, partition)
                 error_type = Errors.for_code(error_code)
                 if not self._subscriptions.is_fetchable(tp):
@@ -390,19 +430,15 @@ class Fetcher:
                     fetch_offset = fetch_offsets[tp]
                     if fetch_offset == tp_assignment.position:
                         tp_assignment.drop_pending_message_set = False
-                    partial = None
-                    if messages and \
-                            isinstance(messages[-1][-1], PartialMessage):
-                        partial = messages.pop()
-
-                    if messages:
+                    batches = list(records)
+                    if batches:
                         log.debug(
                             "Adding fetched record for partition %s with"
                             " offset %d to buffered record list",
                             tp, fetch_offset)
                         try:
                             messages = collections.deque(
-                                self._unpack_message_set(tp, messages))
+                                self._unpack_message_set(tp, batches))
                         except Errors.InvalidMessageError as err:
                             self._set_error(tp, err)
                             continue
@@ -415,15 +451,17 @@ class Fetcher:
 
                         # We added at least 1 successful record
                         needs_wakeup = True
-                    elif partial:
+                    elif records.size_in_bytes() > 0:
                         # we did not read a single message from a non-empty
                         # buffer because that message's size is larger than
                         # fetch size, in this case record this exception
                         err = RecordTooLargeError(
                             "There are some messages at [Partition=Offset]: "
                             "%s=%s whose size is larger than the fetch size %s"
-                            " and hence cannot be ever returned. "
-                            "Increase the fetch size, or decrease the maximum "
+                            " and hence cannot be ever returned. Please "
+                            "consider upgrading your broker to 0.10.1.0 or "
+                            "newer to avoid this issue. Alternately, "
+                            "increase the fetch size, or decrease the maximum "
                             "message size the broker will allow.",
                             tp, fetch_offset, self._max_partition_fetch_bytes)
                         self._set_error(tp, err)
@@ -450,8 +488,8 @@ class Fetcher:
                     self._set_error(tp, err)
                     needs_wakeup = True
                 else:
-                    log.warn('Unexpected error while fetching data: %s',
-                             error_type.__name__)
+                    log.warn('Unexpected error while fetching data: %r %d',
+                             error_type, error_code)
         return needs_wakeup
 
     def _set_error(self, tp, error):
@@ -818,63 +856,26 @@ class Fetcher:
             timeout = timeout - (self._loop.time() - start_time)
             timeout = max(0, timeout)
 
-    def _unpack_message_set(self, tp, messages):
-        for offset, size, msg in messages:
-            if self._check_crcs and not msg.validate_crc():
-                raise Errors.InvalidMessageError(msg)
-            elif msg.is_compressed():
-                # If relative offset is used, we need to decompress the entire
-                # message first to compute the absolute offset.
-                inner_mset = msg.decompress()
-                if msg.magic > 0:
-                    last_offset, _, _ = inner_mset[-1]
-                    absolute_base_offset = offset - last_offset
-                else:
-                    absolute_base_offset = -1
+    def _unpack_message_set(self, tp, batches):
+        for batch in batches:
+            if self._check_crcs and not batch.validate_crc():
+                raise Errors.InvalidMessageError()
 
-                for inner_offset, inner_size, inner_msg in inner_mset:
-                    if msg.magic > 0:
-                        # When magic value is greater than 0, the timestamp
-                        # of a compressed message depends on the
-                        # typestamp type of the wrapper message:
-                        if msg.timestamp_type == 0:  # CREATE_TIME (0)
-                            inner_timestamp = inner_msg.timestamp
-                        elif msg.timestamp_type == 1:  # LOG_APPEND_TIME (1)
-                            inner_timestamp = msg.timestamp
-                        else:
-                            raise ValueError('Unknown timestamp type: {0}'
-                                             .format(msg.timestamp_type))
-                    else:
-                        inner_timestamp = msg.timestamp
-
-                    if absolute_base_offset >= 0:
-                        inner_offset += absolute_base_offset
-
-                    key, value = self._deserialize(inner_msg)
-                    yield ConsumerRecord(
-                        tp.topic, tp.partition, inner_offset,
-                        inner_timestamp, msg.timestamp_type,
-                        key, value, inner_msg.crc,
-                        len(inner_msg.key)
-                        if inner_msg.key is not None else -1,
-                        len(inner_msg.value)
-                        if inner_msg.value is not None else -1)
-            else:
-                key, value = self._deserialize(msg)
+            for record in batch:
+                # Save encoded sizes
+                key_size = len(record.key) if record.key is not None else -1
+                value_size = \
+                    len(record.value) if record.value is not None else -1
+                key, value = self._deserialize(record)
                 yield ConsumerRecord(
-                    tp.topic, tp.partition, offset,
-                    msg.timestamp, msg.timestamp_type,
-                    key, value, msg.crc,
-                    len(msg.key) if msg.key is not None else -1,
-                    len(msg.value) if msg.value is not None else -1)
+                    tp.topic, tp.partition, record.offset, record.timestamp,
+                    record.timestamp_type, key, value, record.checksum,
+                    key_size, value_size)
 
-    def _deserialize(self, msg):
-        if self._key_deserializer:
-            key = self._key_deserializer(msg.key)
-        else:
-            key = msg.key
-        if self._value_deserializer:
-            value = self._value_deserializer(msg.value)
-        else:
-            value = msg.value
+    def _deserialize(self, record):
+        key, value = record.key, record.value
+        if self._key_deserializer and key is not None:
+            key = self._key_deserializer(key)
+        if self._value_deserializer and value is not None:
+            value = self._value_deserializer(value)
         return key, value

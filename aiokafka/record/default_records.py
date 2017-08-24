@@ -57,7 +57,7 @@
 import io
 import struct
 from ._crc32c import crc as crc32c_py
-from .abc import CrcCheckFailed, ABCRecordBatchWriter, ABCRecordBatchReader
+from .abc import ABCRecord, ABCRecordBatchWriter, ABCRecordBatchReader
 
 from kafka.codec import (
     gzip_encode, snappy_encode, lz4_encode,
@@ -286,10 +286,9 @@ class RecordBatchWriter(RecordBatchBase, ABCRecordBatchWriter):
 
 class RecordBatchReader(RecordBatchBase, ABCRecordBatchReader):
 
-    def __init__(self, buffer, validate_crc=True):
-        self._buffer = buffer
-        self._header_data = self._read_header(validate_crc)
-        self._maybe_uncompress()
+    def __init__(self, buffer):
+        self._buffer = io.BytesIO(buffer)
+        self._header_data = self._read_header()
         self._num_records = self._header_data[12]
         self._next_record_index = 0
 
@@ -336,14 +335,18 @@ class RecordBatchReader(RecordBatchBase, ABCRecordBatchReader):
     def __len__(self):
         return self._num_records
 
-    def _read_header(self, validate_crc):
+    def validate_crc(self):
+        inner_buffer = self._buffer.getbuffer()
+        crc = self.crc
+        verify_crc = _calc_crc32c(inner_buffer[self.ATTRIBUTES_OFFSET:])
+        return crc == verify_crc
+
+    def _read_header(self):
         inner_buffer = self._buffer.getbuffer()
         header_data = self.HEADER_STRUCT.unpack_from(inner_buffer)
-        if validate_crc:
-            crc = header_data[4]
-            verify_crc = _calc_crc32c(inner_buffer[self.ATTRIBUTES_OFFSET:])
-            if crc != verify_crc:
-                raise CrcCheckFailed()
+        length = header_data[1]
+        inner_buffer = inner_buffer[:length + self.AFTER_LEN_OFFSET]
+
         self._buffer.seek(self.HEADER_STRUCT.size)
         return header_data
 
@@ -375,7 +378,7 @@ class RecordBatchReader(RecordBatchBase, ABCRecordBatchReader):
         buffer = self._buffer
         length = _decode_varint(buffer)
         start_pos = buffer.tell()
-        attrs = _decode_varint(buffer)  # attrs can be skiped
+        _decode_varint(buffer)  # attrs can be skiped
         ts_delta = _decode_varint(buffer)
         if self.timestamp_type == self.LOG_APPEND_TIME:
             timestamp = self.max_timestamp
@@ -384,9 +387,15 @@ class RecordBatchReader(RecordBatchBase, ABCRecordBatchReader):
         offset_delta = _decode_varint(buffer)
         offset = self.base_offset + offset_delta
         key_len = _decode_varint(buffer)
-        key = buffer.read(key_len)
+        if key_len >= 0:
+            key = buffer.read(key_len)
+        else:
+            key = None
         value_len = _decode_varint(buffer)
-        value = buffer.read(value_len)
+        if value_len >= 0:
+            value = buffer.read(value_len)
+        else:
+            value = None
         header_count = _decode_varint(buffer)
         headers = []
         for i in range(header_count):
@@ -396,9 +405,11 @@ class RecordBatchReader(RecordBatchBase, ABCRecordBatchReader):
             h_value = buffer.read(h_value_len)
             headers.append((h_key, h_value))
         assert buffer.tell() - start_pos == length
-        return (attrs, timestamp, offset, key, value, headers)
+        return DefaultRecord(
+            offset, timestamp, self.timestamp_type, key, value, headers)
 
     def __iter__(self):
+        self._maybe_uncompress()
         return self
 
     def __next__(self):
@@ -407,16 +418,52 @@ class RecordBatchReader(RecordBatchBase, ABCRecordBatchReader):
         self._next_record_index += 1
         return self._read_msg()
 
-    # def seek(self, record_index):
-    #     if record_index >= self._num_records:
-    #         raise IndexError(record_index)
 
-    #     buffer = self._buffer
-    #     if self.compression_type == self.CODEC_NONE:
-    #         buffer.seek(self.HEADER_STRUCT.size)
-    #     else:
-    #         buffer.seek(0)
-    #     for i in range(record_index):
-    #         r_len = _decode_varint(buffer)
-    #         buffer.seek(buffer.tell() + r_len)
-    #     self._next_record_index = record_index
+class DefaultRecord(ABCRecord):
+
+    __slots__ = ("_offset", "_timestamp", "_timestamp_type", "_key", "_value",
+                 "_headers")
+
+    def __init__(self, offset, timestamp, timestamp_type, key, value, headers):
+        self._offset = offset
+        self._timestamp = timestamp
+        self._timestamp_type = timestamp_type
+        self._key = key
+        self._value = value
+        self._headers = headers
+
+    @property
+    def offset(self):
+        return self._offset
+
+    @property
+    def timestamp(self):
+        """ Epoch milliseconds
+        """
+        return self._timestamp
+
+    @property
+    def timestamp_type(self):
+        """ CREATE_TIME(0) or APPEND_TIME(1)
+        """
+        return self._timestamp_type
+
+    @property
+    def key(self):
+        """ Bytes key or None
+        """
+        return self._key
+
+    @property
+    def value(self):
+        """ Bytes value or None
+        """
+        return self._value
+
+    @property
+    def headers(self):
+        return self._headers
+
+    @property
+    def checksum(self):
+        return None

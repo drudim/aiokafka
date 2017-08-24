@@ -10,6 +10,7 @@ from aiokafka.record.default_records import (
 from aiokafka.record.legacy_records import (
     LegacyRecordBatchWriter, LegacyRecordBatchReader
 )
+from aiokafka.record.batch_iterator import BatchIterator
 
 varint_data = [
     (b"\x00", 0),
@@ -51,6 +52,33 @@ varint_data = [
     (b"\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\x7F", -4611686018427387904),
     (b"\x80\x80\x80\x80\x80\x80\x80\x80\x80\x01", 4611686018427387904),
     (b"\x81\x80\x80\x80\x80\x80\x80\x80\x80\x01", -4611686018427387905),
+]
+
+# This is real live data from Kafka 11 broker
+record_batch_data = [
+    # First Batch value == "123"
+    b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00;\x00\x00\x00\x01\x02\x03'
+    b'\x18\xa2p\x00\x00\x00\x00\x00\x00\x00\x00\x01]\xff{\x06<\x00\x00\x01]'
+    b'\xff{\x06<\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\x00'
+    b'\x00\x00\x01\x12\x00\x00\x00\x01\x06123\x00',
+    # Second Batch value = "" and value = "". 2 records
+    b'\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00@\x00\x00\x00\x02\x02\xc8'
+    b'\\\xbd#\x00\x00\x00\x00\x00\x01\x00\x00\x01]\xff|\xddl\x00\x00\x01]\xff'
+    b'|\xde\x14\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\x00'
+    b'\x00\x00\x02\x0c\x00\x00\x00\x01\x00\x00\x0e\x00\xd0\x02\x02\x01\x00'
+    b'\x00',
+    # Third batch value = "123"
+    b'\x00\x00\x00\x00\x00\x00\x00\x03\x00\x00\x00;\x00\x00\x00\x02\x02.\x0b'
+    b'\x85\xb7\x00\x00\x00\x00\x00\x00\x00\x00\x01]\xff|\xe7\x9d\x00\x00\x01]'
+    b'\xff|\xe7\x9d\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff'
+    b'\x00\x00\x00\x01\x12\x00\x00\x00\x01\x06123\x00'
+]
+
+batch_expected_records = [
+    (0, 1503229838908, 0, None, b'123', []),
+    (0, 1503229959532, 1, None, b'', []),
+    (0, 1503229959700, 2, None, b'', []),
+    (0, 1503229962141, 3, None, b'123', []),
 ]
 
 CODEC_MASK = 0x07
@@ -151,3 +179,27 @@ def test_read_write_legacy_serde_v0_v1(compression_type, magic):
     timestamp = 9999999 if magic == 1 else None
     for offset, msg in enumerate(msgs):
         assert msg == (0, timestamp, offset, b"test", b"Super", None)
+
+
+def test_read_v2_stub_data():
+    reader = RecordBatchReader(record_batch_data[0])
+    msgs = list(reader)
+    assert msgs == batch_expected_records[:1]
+    reader = RecordBatchReader(record_batch_data[1])
+    msgs = list(reader)
+    assert msgs == batch_expected_records[1:3]
+    reader = RecordBatchReader(record_batch_data[2])
+    msgs = list(reader)
+    assert msgs == batch_expected_records[3:]
+
+
+def test_read_v2_stub_batch_of_data():
+    batch_data = b"".join(record_batch_data)
+    batch_iter = BatchIterator(batch_data)
+    batch_iter = iter(batch_iter)
+    msgs = list(next(batch_iter))
+    assert msgs == batch_expected_records[:1]
+    msgs = list(next(batch_iter))
+    assert msgs == batch_expected_records[1:3]
+    msgs = list(next(batch_iter))
+    assert msgs == batch_expected_records[3:]

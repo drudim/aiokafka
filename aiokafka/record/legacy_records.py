@@ -1,6 +1,6 @@
 import io
 
-from .abc import CrcCheckFailed, ABCRecordBatchWriter, ABCRecordBatchReader
+from .abc import ABCRecord, ABCRecordBatchWriter, ABCRecordBatchReader
 
 from kafka.codec import (
     gzip_encode, snappy_encode, lz4_encode, lz4_encode_old_kafka,
@@ -101,58 +101,94 @@ class LegacyRecordBatchWriter(ABCRecordBatchWriter):
 
 class LegacyRecordBatchReader(ABCRecordBatchReader):
 
-    def __init__(self, buffer, validate_crc=True):
-        self._messages = MessageSet.decode(buffer)
-        if validate_crc:
-            for offset, size, msg in self._messages:
-                if not msg.validate_crc():
-                    raise CrcCheckFailed()
-        self._maybe_uncompress()
+    def __init__(self, buffer):
+        messages = MessageSet.decode(buffer)
+        assert len(messages), 1
+        self._message = messages[0]
 
-    def _maybe_uncompress(self):
-        messages = self._messages
-        if len(messages) != 1:
-            return
-        offset, size, msg = messages[0]
+    def validate_crc(self):
+        return self._message[2].validate_crc()
 
+    def __iter__(self):
+        offset, size, msg = self._message
         if msg.is_compressed():
             # If relative offset is used, we need to decompress the entire
             # message first to compute the absolute offset.
             inner_mset = msg.decompress()
-            # Only 1 compressed message can be in the outer set
-            assert not inner_mset[0][2].is_compressed()
-            self._messages = inner_mset
-
-    def __iter__(self):
-        for offset, size, msg in self._messages:
-            if msg.is_compressed():
-                # If relative offset is used, we need to decompress the entire
-                # message first to compute the absolute offset.
-                inner_mset = msg.decompress()
-                if msg.magic > 0:
-                    last_offset, _, _ = inner_mset[-1]
-                    absolute_base_offset = offset - last_offset
-                else:
-                    absolute_base_offset = -1
-
-                for inner_offset, inner_size, inner_msg in inner_mset:
-                    if msg.magic > 0:
-                        # When magic value is greater than 0, the timestamp
-                        # of a compressed message depends on the
-                        # typestamp type of the wrapper message:
-                        if msg.timestamp_type == 0:  # CREATE_TIME (0)
-                            inner_timestamp = inner_msg.timestamp
-                        else:  # LOG_APPEND_TIME (1)
-                            inner_timestamp = msg.timestamp
-                    else:
-                        inner_timestamp = 0
-
-                    if absolute_base_offset >= 0:
-                        inner_offset += absolute_base_offset
-
-                    yield (
-                        0, inner_timestamp, inner_offset, inner_msg.key,
-                        inner_msg.value, None
-                    )
+            if msg.magic > 0:
+                last_offset, _, _ = inner_mset[-1]
+                absolute_base_offset = offset - last_offset
             else:
-                yield 0, msg.timestamp, offset, msg.key, msg.value, None
+                absolute_base_offset = -1
+
+            for inner_offset, inner_size, inner_msg in inner_mset:
+                if msg.magic > 0:
+                    # When magic value is greater than 0, the timestamp
+                    # of a compressed message depends on the
+                    # typestamp type of the wrapper message:
+                    if msg.timestamp_type == 0:  # CREATE_TIME (0)
+                        inner_timestamp = inner_msg.timestamp
+                    else:  # LOG_APPEND_TIME (1)
+                        inner_timestamp = msg.timestamp
+                else:
+                    inner_timestamp = 0
+
+                if absolute_base_offset >= 0:
+                    inner_offset += absolute_base_offset
+
+                yield LegacyRecord(
+                    inner_offset, inner_timestamp, msg.timestamp_type,
+                    inner_msg.key, inner_msg.value, inner_msg.crc)
+        else:
+            yield LegacyRecord(offset, msg.timestamp, msg.timestamp_type,
+                               msg.key, msg.value, msg.crc)
+
+
+class LegacyRecord(ABCRecord):
+
+    __slots__ = ("_offset", "_timestamp", "_timestamp_type", "_key", "_value",
+                 "_crc")
+
+    def __init__(self, offset, timestamp, timestamp_type, key, value, crc):
+        self._offset = offset
+        self._timestamp = timestamp
+        self._timestamp_type = timestamp_type
+        self._key = key
+        self._value = value
+        self._crc = crc
+
+    @property
+    def offset(self):
+        return self._offset
+
+    @property
+    def timestamp(self):
+        """ Epoch milliseconds
+        """
+        return self._timestamp
+
+    @property
+    def timestamp_type(self):
+        """ CREATE_TIME(0) or APPEND_TIME(1)
+        """
+        return self._timestamp_type
+
+    @property
+    def key(self):
+        """ Bytes key or None
+        """
+        return self._key
+
+    @property
+    def value(self):
+        """ Bytes value or None
+        """
+        return self._value
+
+    @property
+    def headers(self):
+        return []
+
+    @property
+    def checksum(self):
+        return self._crc
