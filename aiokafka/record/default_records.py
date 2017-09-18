@@ -56,64 +56,17 @@
 
 import io
 import struct
-from ._crc32c import crc as crc32c_py
-from .abc import ABCRecord, ABCRecordBatchWriter, ABCRecordBatchReader
+from .abc import ABCRecord, ABCRecordBatch, ABCRecordBatchBuilder
+from .util import decode_varint, encode_varint, calc_crc32c, size_of_varint
 
+from aiokafka.errors import CorruptRecordException
 from kafka.codec import (
     gzip_encode, snappy_encode, lz4_encode,
     gzip_decode, snappy_decode, lz4_decode
 )
 
 
-def _encode_varint(buffer: io.BytesIO, num: int):
-    # Shift sign to the end of number
-    num = (num << 1) ^ (num >> 63)
-    # Max 10 bytes. We assert whose are allocated
-    buf = bytearray(10)
-
-    for i in range(10):
-        # 7 lowest bits from the number and set 8th if we still have pending
-        # bits left to encode
-        buf[i] = num & 0x7f | (0x80 if num > 0x7f else 0)
-        num = num >> 7
-        if num == 0:
-            break
-    else:
-        # Max size of endcoded double is 10 bytes for unsigned values
-        raise ValueError("Out of double range")
-    buffer.write(buf[:i + 1])
-
-
-def _decode_varint(buffer: io.BytesIO) -> int:
-    value = 0
-    shift = 0
-    pos = buffer.tell()
-    inner_buffer = buffer.getbuffer()[pos:]
-    for i in range(10):
-        try:
-            byte = inner_buffer[i]
-        except IndexError:
-            raise ValueError("End of byte stream")
-        if byte & 0x80 != 0:
-            value |= (byte & 0x7f) << shift
-            shift += 7
-        else:
-            value |= byte << shift
-            break
-    else:
-        # Max size of endcoded double is 10 bytes for unsigned values
-        raise ValueError("Out of double range")
-    buffer.seek(pos + i + 1)
-    # Normalize sign
-    return (value >> 1) ^ -(value & 1)
-
-
-def _calc_crc32c(memview_from):
-    crc = crc32c_py(memview_from)
-    return crc
-
-
-class RecordBatchBase:
+class DefaultRecordBase(object):
 
     HEADER_STRUCT = struct.Struct(
         ">q"  # BaseOffset => Int64
@@ -148,149 +101,15 @@ class RecordBatchBase:
     CREATE_TIME = 0
 
 
-class RecordBatchWriter(RecordBatchBase, ABCRecordBatchWriter):
-
-    __slots__ = ("_magic", "_compression_type", "_is_transactional",
-                 "_producer_id", "_producer_epoch", "_base_sequence",
-                 "_max_timestamp", "_first_timestamp", "_last_offset",
-                 "_num_records", "_buffer", "_batch_size")
-
-    def __init__(
-            self, *, magic, compression_type, is_transactional,
-            producer_id, producer_epoch, base_sequence, batch_size):
-        assert magic >= 2
-        self._magic = magic
-        self._compression_type = compression_type & self.CODEC_MASK
-        self._is_transactional = bool(is_transactional)
-        # KIP-98 fields for EOS
-        self._producer_id = producer_id
-        self._producer_epoch = producer_epoch
-        self._base_sequence = base_sequence
-
-        self._first_timestamp = None
-        self._max_timestamp = None
-        self._last_offset = 0
-        self._num_records = 0
-
-        # We init with a padding for header. We will write it later
-        self._buffer = io.BytesIO(bytes(self.HEADER_STRUCT.size))
-        self._buffer.seek(self.HEADER_STRUCT.size)
-        self._batch_size = batch_size
-
-    def _get_attributes(self, include_compression_type=True):
-        attrs = 0
-        if include_compression_type:
-            attrs |= self._compression_type
-        # Timestamp Type is set by Broker
-        if self._is_transactional:
-            attrs |= self.TRANSACTIONAL_MASK
-        # Control batches are only created by Broker
-        return attrs
-
-    def append(self, offset, timestamp, key, value, headers):
-        """ Write message to messageset buffer with MsgVersion 2
-        """
-        if self._first_timestamp is None:
-            self._first_timestamp = timestamp
-            self._max_timestamp = timestamp
-            timestamp_delta = 0
-        else:
-            timestamp_delta = timestamp - self._first_timestamp
-            if self._max_timestamp < timestamp:
-                self._max_timestamp = timestamp
-        self._last_offset = offset
-        self._num_records += 1
-        offset_delta = offset  # Base offset is always 0 on Produce
-
-        # We can't write record right away to out buffer, we need to precompute
-        # the length as first value...
-        message_buffer = io.BytesIO()
-        message_buffer.write(b"\x00")  # Attributes
-        _encode_varint(message_buffer, timestamp_delta)
-        _encode_varint(message_buffer, offset_delta)
-        _encode_varint(message_buffer, len(key))
-        message_buffer.write(key)
-        _encode_varint(message_buffer, len(value))
-        message_buffer.write(value)
-        _encode_varint(message_buffer, len(headers))
-
-        for h_key, h_value in headers:
-            _encode_varint(message_buffer, len(h_key))
-            message_buffer.write(h_key)
-            _encode_varint(message_buffer, len(h_value))
-            message_buffer.write(h_value)
-
-        message_len = message_buffer.tell()
-
-        # Check if we can write this record
-        tmp_buf = io.BytesIO()
-        _encode_varint(tmp_buf, message_len)
-        if self._buffer.tell() + message_len + tmp_buf.tell() > \
-                self._batch_size:
-            return False
-
-        _encode_varint(self._buffer, message_len)
-        self._buffer.write(message_buffer.getbuffer())
-        message_buffer.close()
-        return True
-
-    def write_header(self, use_compression_type=True):
-        batch_len = self._buffer.tell()
-        inner_buffer = self._buffer.getbuffer()
-        self.HEADER_STRUCT.pack_into(
-            inner_buffer, 0,
-            0,  # BaseOffset, set by broker
-            batch_len - self.AFTER_LEN_OFFSET,  # Size from here to batch end
-            0,  # PartitionLeaderEpoch, set by broker
-            self._magic,
-            0,  # CRC will be set below, as we need a filled buffer for it
-            self._get_attributes(use_compression_type),
-            self._last_offset,
-            self._first_timestamp,
-            self._max_timestamp,
-            self._producer_id,
-            self._producer_epoch,
-            self._base_sequence,
-            self._num_records
-        )
-        crc = _calc_crc32c(inner_buffer[self.ATTRIBUTES_OFFSET:])
-        struct.pack_into(">I", inner_buffer, self.CRC_OFFSET, crc)
-
-    def _maybe_compress(self):
-        if self._compression_type != self.CODEC_NONE:
-            data = self._buffer.getbuffer()[self.HEADER_STRUCT.size:]
-            if self._compression_type == self.CODEC_GZIP:
-                compressed = gzip_encode(data.tobytes())
-            elif self._compression_type == self.CODEC_SNAPPY:
-                compressed = snappy_encode(data)
-            elif self._compression_type == self.CODEC_LZ4:
-                compressed = lz4_encode(data.tobytes())
-            compressed_size = len(compressed)
-            if len(data) <= compressed_size:
-                # We did not get any benefit from compression, lets send
-                # uncompressed
-                return False
-            else:
-                data[:compressed_size] = compressed
-                data.release()
-                self._buffer.seek(compressed_size + self.HEADER_STRUCT.size)
-                self._buffer.truncate()
-                return True
-
-    def close(self):
-        send_compressed = self._maybe_compress()
-        self.write_header(send_compressed)
-        self._buffer.seek(0)
-        return self._buffer
-
-
-class RecordBatchReader(RecordBatchBase, ABCRecordBatchReader):
+class DefaultRecordBatch(DefaultRecordBase, ABCRecordBatch):
 
     def __init__(self, buffer):
-        self._buffer = io.BytesIO(buffer)
-        self._header_data = self._read_header()
+        self._buffer = memoryview(buffer)
+        self._header_data = self.HEADER_STRUCT.unpack_from(self._buffer)
+        self._pos = self.HEADER_STRUCT.size
         self._num_records = self._header_data[12]
         self._next_record_index = 0
+        self._decompressed = False
 
     @property
     def base_offset(self):
@@ -332,36 +151,20 @@ class RecordBatchReader(RecordBatchBase, ABCRecordBatchReader):
     def max_timestamp(self):
         return self._header_data[8]
 
-    def __len__(self):
-        return self._num_records
-
-    def validate_crc(self):
-        inner_buffer = self._buffer.getbuffer()
-        crc = self.crc
-        verify_crc = _calc_crc32c(inner_buffer[self.ATTRIBUTES_OFFSET:])
-        return crc == verify_crc
-
-    def _read_header(self):
-        inner_buffer = self._buffer.getbuffer()
-        header_data = self.HEADER_STRUCT.unpack_from(inner_buffer)
-        length = header_data[1]
-        inner_buffer = inner_buffer[:length + self.AFTER_LEN_OFFSET]
-
-        self._buffer.seek(self.HEADER_STRUCT.size)
-        return header_data
-
     def _maybe_uncompress(self):
-        compression_type = self.compression_type
-        if compression_type != self.CODEC_NONE:
-            inner_buffer = self._buffer.getbuffer()
-            data = inner_buffer[self.HEADER_STRUCT.size:]
-            if compression_type == self.CODEC_GZIP:
-                uncompressed = gzip_decode(data)
-            if compression_type == self.CODEC_SNAPPY:
-                uncompressed = snappy_decode(data.tobytes())
-            if compression_type == self.CODEC_LZ4:
-                uncompressed = lz4_decode(data.tobytes())
-            self._buffer = io.BytesIO(uncompressed)
+        if not self._decompressed:
+            compression_type = self.compression_type
+            if compression_type != self.CODEC_NONE:
+                data = self._buffer[self._pos:]
+                if compression_type == self.CODEC_GZIP:
+                    uncompressed = gzip_decode(data)
+                if compression_type == self.CODEC_SNAPPY:
+                    uncompressed = snappy_decode(data.tobytes())
+                if compression_type == self.CODEC_LZ4:
+                    uncompressed = lz4_decode(data.tobytes())
+                self._buffer = memoryview(uncompressed)
+                self._pos = 0
+        self._decompressed = True
 
     def _read_msg(self):
         # Record =>
@@ -376,35 +179,65 @@ class RecordBatchReader(RecordBatchBase, ABCRecordBatchReader):
         #     HeaderValue => Bytes
 
         buffer = self._buffer
-        length = _decode_varint(buffer)
-        start_pos = buffer.tell()
-        _decode_varint(buffer)  # attrs can be skiped
-        ts_delta = _decode_varint(buffer)
+        pos = self._pos
+        length, pos = decode_varint(buffer, pos)
+        start_pos = pos
+        _, pos = decode_varint(buffer, pos)  # attrs can be skipped for now
+
+        ts_delta, pos = decode_varint(buffer, pos)
         if self.timestamp_type == self.LOG_APPEND_TIME:
             timestamp = self.max_timestamp
         else:
             timestamp = self.first_timestamp + ts_delta
-        offset_delta = _decode_varint(buffer)
+
+        offset_delta, pos = decode_varint(buffer, pos)
         offset = self.base_offset + offset_delta
-        key_len = _decode_varint(buffer)
+
+        key_len, pos = decode_varint(buffer, pos)
         if key_len >= 0:
-            key = buffer.read(key_len)
+            key = buffer[pos: pos + key_len].tobytes()
+            pos += key_len
         else:
             key = None
-        value_len = _decode_varint(buffer)
+
+        value_len, pos = decode_varint(buffer, pos)
         if value_len >= 0:
-            value = buffer.read(value_len)
+            value = buffer[pos: pos + value_len].tobytes()
+            pos += value_len
         else:
             value = None
-        header_count = _decode_varint(buffer)
+
+        header_count, pos = decode_varint(buffer, pos)
+        if header_count < 0:
+            raise CorruptRecordException("Found invalid number of record "
+                                         "headers {}".format(header_count))
         headers = []
-        for i in range(header_count):
-            h_key_len = _decode_varint(buffer)
-            h_key = buffer.read(h_key_len)
-            h_value_len = _decode_varint(buffer)
-            h_value = buffer.read(h_value_len)
+        for _ in range(header_count):
+            # Header key is of type String, that can't be None
+            h_key_len, pos = decode_varint(buffer, pos)
+            if h_key_len < 0:
+                raise CorruptRecordException(
+                    "Invalid negative header key size {}".format(h_key_len))
+            h_key = buffer[pos: pos + h_key_len].tobytes().decode("utf-8")
+            pos += h_key_len
+
+            # Value is of type NULLABLE_BYTES, so it can be None
+            h_value_len, pos = decode_varint(buffer, pos)
+            if h_value_len >= 0:
+                h_value = buffer[pos: pos + h_value_len].tobytes()
+                pos += h_value_len
+            else:
+                h_value = None
+
             headers.append((h_key, h_value))
-        assert buffer.tell() - start_pos == length
+
+        # validate whether we have read all header bytes in the current record
+        if pos - start_pos != length:
+            CorruptRecordException(
+                "Invalid record size: expected to read {} bytes in record "
+                "payload, but instead read {}".format(length, pos - start_pos))
+        self._pos = pos
+
         return DefaultRecord(
             offset, timestamp, self.timestamp_type, key, value, headers)
 
@@ -414,9 +247,30 @@ class RecordBatchReader(RecordBatchBase, ABCRecordBatchReader):
 
     def __next__(self):
         if self._next_record_index >= self._num_records:
+            if self._pos != len(self._buffer):
+                raise CorruptRecordException(
+                    "{} unconsumed bytes after all records consumed".format(
+                        len(self._buffer) - self._pos))
             raise StopIteration
-        self._next_record_index += 1
-        return self._read_msg()
+        try:
+            msg = self._read_msg()
+        except ValueError as err:
+            raise CorruptRecordException(
+                "Found invalid record structure: {!r}".format(err))
+        else:
+            self._next_record_index += 1
+        return msg
+
+    next = __next__
+
+    def validate_crc(self):
+        assert self._decompressed is False, \
+            "Validate should be called before iteration"
+
+        crc = self.crc
+        data_view = self._buffer[self.ATTRIBUTES_OFFSET:]
+        verify_crc = calc_crc32c(data_view)
+        return crc == verify_crc
 
 
 class DefaultRecord(ABCRecord):
@@ -467,3 +321,207 @@ class DefaultRecord(ABCRecord):
     @property
     def checksum(self):
         return None
+
+    def __repr__(self):
+        return (
+            "DefaultRecord(offset={!r}, timestamp={!r}, timestamp_type={!r},"
+            " key={!r}, value={!r}, headers={!r})".format(
+                self._offset, self._timestamp, self._timestamp_type,
+                self._key, self._value, self._headers)
+        )
+
+
+class DefaultRecordBatchBuilder(DefaultRecordBase, ABCRecordBatchBuilder):
+
+    # excluding key, value and headers:
+    # 5 bytes length + 10 bytes timestamp + 5 bytes offset + 1 byte attributes
+    MAX_RECORD_OVERHEAD = 21
+
+    def __init__(
+            self, magic, compression_type, is_transactional,
+            producer_id, producer_epoch, base_sequence,
+            buffer=None):
+        assert magic >= 2
+        self._magic = magic
+        self._compression_type = compression_type & self.CODEC_MASK
+        self._is_transactional = bool(is_transactional)
+        # KIP-98 fields for EOS
+        self._producer_id = producer_id
+        self._producer_epoch = producer_epoch
+        self._base_sequence = base_sequence
+
+        self._first_timestamp = None
+        self._max_timestamp = None
+        self._last_offset = 0
+        self._num_records = 0
+
+        self._buffer = buffer if buffer is not None else io.BytesIO()
+        # We can just move pointer out of bounds, null bytes will be inserted
+        # on the missing part on first write
+        self._buffer.seek(self.HEADER_STRUCT.size)
+
+    def _get_attributes(self, include_compression_type=True):
+        attrs = 0
+        if include_compression_type:
+            attrs |= self._compression_type
+        # Timestamp Type is set by Broker
+        if self._is_transactional:
+            attrs |= self.TRANSACTIONAL_MASK
+        # Control batches are only created by Broker
+        return attrs
+
+    def append(self, offset, timestamp, key, value, headers):
+        """ Write message to messageset buffer with MsgVersion 2
+        """
+        if self._first_timestamp is None:
+            self._first_timestamp = timestamp
+            self._max_timestamp = timestamp
+            timestamp_delta = 0
+        else:
+            timestamp_delta = timestamp - self._first_timestamp
+            if self._max_timestamp < timestamp:
+                self._max_timestamp = timestamp
+        self._last_offset = offset
+        self._num_records += 1
+        offset_delta = offset  # Base offset is always 0 on Produce
+
+        # We can't write record right away to out buffer, we need to precompute
+        # the length as first value...
+        message_buffer = io.BytesIO()
+        message_buffer.write(b"\x00")  # Attributes
+        message_buffer.write(encode_varint(timestamp_delta))
+        message_buffer.write(encode_varint(offset_delta))
+
+        if key is not None:
+            message_buffer.write(encode_varint(len(key)))
+            message_buffer.write(key)
+        else:
+            message_buffer.write(encode_varint(-1))
+
+        if value is not None:
+            message_buffer.write(encode_varint(len(value)))
+            message_buffer.write(value)
+        else:
+            message_buffer.write(encode_varint(-1))
+
+        message_buffer.write(encode_varint(len(headers)))
+
+        for h_key, h_value in headers:
+            h_key = h_key.encode("utf-8")
+            message_buffer.write(encode_varint(len(h_key)))
+            message_buffer.write(h_key)
+            if h_value is not None:
+                message_buffer.write(encode_varint(len(h_value)))
+                message_buffer.write(h_value)
+            else:
+                message_buffer.write(encode_varint(-1))
+
+        message_len = message_buffer.tell()
+        message_len_enc = encode_varint(message_len)
+
+        self._buffer.write(message_len_enc)
+        message_enc = message_buffer.getvalue()
+        self._buffer.write(message_enc)
+        message_buffer.close()
+        return None, message_len + len(message_len_enc)
+
+    def write_header(self, use_compression_type=True):
+        batch_len = self._buffer.tell()
+        packed = self.HEADER_STRUCT.pack(
+            0,  # BaseOffset, set by broker
+            batch_len - self.AFTER_LEN_OFFSET,  # Size from here to end
+            0,  # PartitionLeaderEpoch, set by broker
+            self._magic,
+            0,  # CRC will be set below, as we need a filled buffer for it
+            self._get_attributes(use_compression_type),
+            self._last_offset,
+            self._first_timestamp,
+            self._max_timestamp,
+            self._producer_id,
+            self._producer_epoch,
+            self._base_sequence,
+            self._num_records
+        )
+        self._buffer.seek(0)
+        self._buffer.write(packed)
+        self._buffer.seek(self.ATTRIBUTES_OFFSET)
+        crc = calc_crc32c(self._buffer.read())
+        self._buffer.seek(self.CRC_OFFSET)
+        self._buffer.write(struct.pack(">I", crc))
+
+    def _maybe_compress(self):
+        if self._compression_type != self.CODEC_NONE:
+            self._buffer.seek(self.HEADER_STRUCT.size)
+            data = self._buffer.read()
+            if self._compression_type == self.CODEC_GZIP:
+                compressed = gzip_encode(data)
+            elif self._compression_type == self.CODEC_SNAPPY:
+                compressed = snappy_encode(data)
+            elif self._compression_type == self.CODEC_LZ4:
+                compressed = lz4_encode(data)
+            compressed_size = len(compressed)
+            if len(data) <= compressed_size:
+                # We did not get any benefit from compression, lets send
+                # uncompressed
+                return False
+            else:
+                self._buffer.seek(self.HEADER_STRUCT.size)
+                self._buffer.write(compressed)
+                self._buffer.truncate()
+                return True
+        return False
+
+    def build(self):
+        send_compressed = self._maybe_compress()
+        self.write_header(send_compressed)
+        return self._buffer
+
+    def size_in_bytes(self, offset, timestamp, key, value, headers):
+        if self._first_timestamp is not None:
+            timestamp_delta = timestamp - self._first_timestamp
+        else:
+            timestamp_delta = 0
+        size_of_body = (
+            1 +  # Attrs
+            size_of_varint(offset) +
+            size_of_varint(timestamp_delta) +
+            self.size_of(key, value, headers)
+        )
+        return size_of_body + size_of_varint(size_of_body)
+
+    @classmethod
+    def size_of(cls, key, value, headers):
+        size = 0
+        # Key size
+        if key is None:
+            size += 1
+        else:
+            key_len = len(key)
+            size += size_of_varint(key_len) + key_len
+        # Value size
+        if value is None:
+            size += 1
+        else:
+            value_len = len(value)
+            size += size_of_varint(value_len) + value_len
+        # Header size
+        size += size_of_varint(len(headers))
+        for h_key, h_value in headers:
+            h_key_len = len(h_key.encode("utf-8"))
+            size += size_of_varint(h_key_len) + h_key_len
+
+            if h_value is None:
+                size += 1
+            else:
+                h_value_len = len(h_value)
+                size += size_of_varint(h_value_len) + h_value_len
+        return size
+
+    @classmethod
+    def estimate_size_in_bytes(cls, key, value, headers):
+        """ Get the upper bound estimate on the size of record
+        """
+        return (
+            cls.HEADER_STRUCT.size + cls.MAX_RECORD_OVERHEAD +
+            cls.size_of(key, value, headers)
+        )

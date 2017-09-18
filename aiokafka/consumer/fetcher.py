@@ -5,10 +5,10 @@ import random
 from itertools import chain
 
 # from kafka.protocol.fetch import FetchRequest
-from kafka.protocol.message import PartialMessage
 from kafka.protocol.offset import OffsetRequest, OffsetResetStrategy
 
 from aiokafka.record.fetch import FetchRequest
+from aiokafka.record.memory_records import MemoryRecords
 import aiokafka.errors as Errors
 from aiokafka.errors import (
     ConsumerStoppedError, RecordTooLargeError, KafkaTimeoutError)
@@ -412,7 +412,7 @@ class Fetcher:
                 fetch_offsets[TopicPartition(topic, partition)] = offset
 
         for topic, partitions in response.topics:
-            for partition, error_code, highwater, _, _, records in partitions:
+            for partition, error_code, highwater, *other in partitions:
                 tp = TopicPartition(topic, partition)
                 error_type = Errors.for_code(error_code)
                 if not self._subscriptions.is_fetchable(tp):
@@ -430,8 +430,9 @@ class Fetcher:
                     fetch_offset = fetch_offsets[tp]
                     if fetch_offset == tp_assignment.position:
                         tp_assignment.drop_pending_message_set = False
-                    batches = list(records)
-                    if batches:
+
+                    records = MemoryRecords(other[-1])
+                    if records.has_next():
                         log.debug(
                             "Adding fetched record for partition %s with"
                             " offset %d to buffered record list",

@@ -13,7 +13,7 @@ __all__ = [
     "UnknownMemberIdError", "GroupLoadInProgressError",
     "GroupCoordinatorNotAvailableError", "NotCoordinatorForGroupError",
     "GroupAuthorizationFailedError", "IllegalStateError",
-    "UnsupportedVersionError",
+    "UnsupportedVersionError", "InvalidMessageError", "CorruptRecordException",
     # aiokafka custom errors
     "ConsumerStoppedError", "NoOffsetForPartitionError", "RecordTooLargeError",
     "ProducerClosed"
@@ -43,3 +43,6 @@ class RecordTooLargeError(KafkaError):
 
 class ProducerClosed(KafkaError):
     pass
+
+
+CorruptRecordException = InvalidMessageError

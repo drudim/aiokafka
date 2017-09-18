@@ -1,59 +1,14 @@
+from __future__ import absolute_import
 import abc
-from collections import namedtuple
 
 
-Record = namedtuple(
-    "Record", ["attrs", "timestamp", "offset", "key", "value", "headers",
-               "timestamp_type"])
-
-
-class CorruptRecordException(Exception):
-    pass
-
-
-class CrcCheckFailed(CorruptRecordException):
-
-    def __init__(self, record_crc, calc_crc):
-        message = "Record crc {} does not match calculated {}".format(
-            record_crc, calc_crc)
-        super().__init__(message)
-
-
-class ABCRecordBatchWriter(abc.ABC):
-
-    @abc.abstractmethod
-    def append(self, offset, timestamp, key, value, headers):
-        """ Writes record to internal buffer
-        """
-
-    @abc.abstractmethod
-    def close(self):
-        """ Stop appending new messages, write header, compress if needed and
-        return compressed bytes ready to be sent.
-
-            Returns: io.BytesIO buffer with ready to send data
-        """
-
-
-class ABCRecordBatchReader(abc.ABC):
-
-    @abc.abstractmethod
-    def __init__(self, buffer, validate_crc):
-        """ Initialize with io.BytesIO buffer that can be read from
-        """
-        pass
-
-    @abc.abstractmethod
-    def __iter__(self):
-        """ Return iterator over records
-        """
-
-
-class ABCRecord(abc.ABC):
+class ABCRecord(object):
+    __metaclass__ = abc.ABCMeta
 
     @abc.abstractproperty
     def offset(self):
-        pass
+        """ Absolute offset of record
+        """
 
     @abc.abstractproperty
     def timestamp(self):
@@ -85,4 +40,80 @@ class ABCRecord(abc.ABC):
     def headers(self):
         """ If supported by version list of key-value tuples, or empty list if
             not supported by format.
+        """
+
+
+class ABCRecordBatchBuilder(object):
+    __metaclass__ = abc.ABCMeta
+
+    @abc.abstractmethod
+    def append(self, offset, timestamp, key, value, headers):
+        """ Writes record to internal buffer.
+
+        Arguments:
+            offset (int): Relative offset of record, starting from 0
+            timestamp (int): Timestamp in milliseconds since beginning of the
+                epoch (midnight Jan 1, 1970 (UTC))
+            key (bytes or None): Key of the record
+            value (bytes or None): Value of the record
+            headers (List[Tuple[str, bytes]]): Headers of the record. Header
+                keys can not be ``None``.
+
+        Returns:
+            (bytes, int): Checksum of the written record (or None for v2 and
+                above) and size of the written record.
+        """
+
+    @abc.abstractmethod
+    def size_in_bytes(self, offset, timestamp, key, value, headers):
+        """ Return the expected size change on buffer (uncompressed) if we add
+            this message. This will account for varint size changes and give a
+            reliable size.
+        """
+
+    @abc.abstractmethod
+    def build(self):
+        """ Close for append, compress if needed, write size and header and
+            return a ready to send bytes object.
+
+            Return:
+                io.BytesIO: finished batch, ready to send.
+        """
+
+
+class ABCRecordBatch(object):
+    """ For v2 incapsulates a RecordBatch, for v0/v1 a single (maybe
+        compressed) message.
+    """
+    __metaclass__ = abc.ABCMeta
+
+    @abc.abstractmethod
+    def __iter__(self):
+        """ Return iterator over records (ABCRecord instances). Will decompress
+            if needed.
+        """
+
+
+class ABCRecords(object):
+    __metaclass__ = abc.ABCMeta
+
+    @abc.abstractmethod
+    def __init__(self, buffer):
+        """ Initialize with bytes-like object conforming to the buffer
+            interface (ie. bytes, bytearray, memoryview etc.).
+        """
+
+    @abc.abstractmethod
+    def size_in_bytes(self):
+        """ Returns the size of buffer.
+        """
+
+    @abc.abstractmethod
+    def next_batch(self):
+        """ Return next batch of records (ABCRecordBatch instances).
+        """
+
+    @abc.abstractmethod
+    def has_next(self):
+        """ True if there are more batches to read, False otherwise.
         """
