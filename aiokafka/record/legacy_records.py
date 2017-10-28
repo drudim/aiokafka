@@ -326,41 +326,56 @@ class _LegacyRecordBatchBuilderPy(LegacyRecordBase):
         """
         magic = self._magic
         buf = self._buffer
-        pos = start_pos
 
-        # Write key and value
-        pos += self.KEY_OFFSET_V0 if magic == 0 else self.KEY_OFFSET_V1
+        # calculating length is not cheap; only do it once
+        key_size = len(key) if key is not None else 0
+        value_size = len(value) if value is not None else 0
 
-        if key is None:
-            struct.pack_into(">i", buf, pos, -1)
-            pos += self.KEY_LENGTH
-        else:
-            key_size = len(key)
-            struct.pack_into(">i", buf, pos, key_size)
-            pos += self.KEY_LENGTH
-            buf[pos: pos + key_size] = key
-            pos += key_size
+        length = (
+            self.KEY_LENGTH + key_size +
+            self.VALUE_LENGTH + value_size -
+            self.LOG_OVERHEAD
+        )
 
-        if value is None:
-            struct.pack_into(">i", buf, pos, -1)
-            pos += self.VALUE_LENGTH
-        else:
-            value_size = len(value)
-            struct.pack_into(">i", buf, pos, value_size)
-            pos += self.VALUE_LENGTH
-            buf[pos: pos + value_size] = value
-            pos += value_size
-        length = (pos - start_pos) - self.LOG_OVERHEAD
-
-        # Write msg header. Note, that Crc will be updated later
         if magic == 0:
-            self.HEADER_STRUCT_V0.pack_into(
+            length += self.KEY_OFFSET_V0
+            struct.pack_into(
+                ">q"   # BaseOffset => Int64
+                "i"    # Length => Int32
+                "I"    # CRC => Int32
+                "b"    # Magic => Int8
+                "b"    # Attributes => Int8
+                "i"    # key length => Int32
+                "%ds"  # key => bytes
+                "i"    # value length => Int32
+                "%ds"  # value => bytes
+                % (key_size, value_size),
                 buf, start_pos,
-                offset, length, 0, magic, attributes)
+                offset, length, 0, magic, attributes,
+                -1 if key is None else key_size,
+                key or b"",
+                -1 if value is None else value_size,
+                value or b"")
         else:
-            self.HEADER_STRUCT_V1.pack_into(
+            length += self.KEY_OFFSET_V1
+            struct.pack_into(
+                ">q"   # BaseOffset => Int64
+                "i"    # Length => Int32
+                "I"    # CRC => Int32
+                "b"    # Magic => Int8
+                "b"    # Attributes => Int8
+                "q"    # timestamp => Int64
+                "i"    # key length => Int32
+                "%ds"  # key => bytes
+                "i"    # value length => Int32
+                "%ds"  # value => bytes
+                % (key_size, value_size),
                 buf, start_pos,
-                offset, length, 0, magic, attributes, timestamp)
+                offset, length, 0, magic, attributes, timestamp,
+                -1 if key is None else key_size,
+                key or b"",
+                -1 if value is None else value_size,
+                value or b"")
 
         # Calculate CRC for msg
         crc_data = memoryview(buf)[start_pos + self.MAGIC_OFFSET:]
