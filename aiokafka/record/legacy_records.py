@@ -286,23 +286,10 @@ class _LegacyRecordBatchBuilderPy(LegacyRecordBase):
     def append(self, offset, timestamp, key, value):
         """ Append message to batch.
         """
-        # Check types
-        if type(offset) != int:
-            raise TypeError(offset)
         if self._magic == 0:
             timestamp = -1
         elif timestamp is None:
             timestamp = int(time.time() * 1000)
-        elif type(timestamp) != int:
-            raise TypeError(timestamp)
-        if not (key is None or
-                isinstance(key, (bytes, bytearray, memoryview))):
-            raise TypeError(
-                "Not supported type for key: {}".format(type(key)))
-        if not (value is None or
-                isinstance(value, (bytes, bytearray, memoryview))):
-            raise TypeError(
-                "Not supported type for value: {}".format(type(value)))
 
         # Check if we have room for another message
         pos = len(self._buffer)
@@ -315,9 +302,26 @@ class _LegacyRecordBatchBuilderPy(LegacyRecordBase):
         self._buffer.extend(bytearray(size))
 
         # Encode message
-        crc = self._encode_msg(pos, offset, timestamp, key, value)
-
-        return LegacyRecordMetadata(offset, crc, size, timestamp)
+        try:
+            crc = self._encode_msg(pos, offset, timestamp, key, value)
+            return LegacyRecordMetadata(offset, crc, size, timestamp)
+        except struct.error:
+            # Fix buffer back
+            del self._buffer[pos:]
+            # Check types
+            if type(offset) != int:
+                raise TypeError(offset)
+            if type(timestamp) != int:
+                raise TypeError(timestamp)
+            if not (key is None or
+                    isinstance(key, (bytes, bytearray, memoryview))):
+                raise TypeError(
+                    "Not supported type for key: {}".format(type(key)))
+            if not (value is None or
+                    isinstance(value, (bytes, bytearray, memoryview))):
+                raise TypeError(
+                    "Not supported type for value: {}".format(type(value)))
+            raise
 
     def _encode_msg(self, start_pos, offset, timestamp, key, value,
                     attributes=0):
