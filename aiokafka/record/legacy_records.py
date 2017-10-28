@@ -291,9 +291,14 @@ class _LegacyRecordBatchBuilderPy(LegacyRecordBase):
         elif timestamp is None:
             timestamp = int(time.time() * 1000)
 
+        # calculating length is not cheap; only do it once
+        key_size = len(key) if key is not None else 0
+        value_size = len(value) if value is not None else 0
+
         # Check if we have room for another message
         pos = len(self._buffer)
-        size = self.size_in_bytes(offset, timestamp, key, value)
+        size = self._size_in_bytes(
+            offset, timestamp, key_size, value_size)
         # We always allow at least one record to be appended
         if offset != 0 and pos + size >= self._batch_size:
             return None
@@ -303,7 +308,8 @@ class _LegacyRecordBatchBuilderPy(LegacyRecordBase):
 
         # Encode message
         try:
-            crc = self._encode_msg(pos, offset, timestamp, key, value)
+            crc = self._encode_msg(
+                pos, offset, timestamp, key, key_size, value, value_size)
             return LegacyRecordMetadata(offset, crc, size, timestamp)
         except struct.error:
             # Fix buffer back
@@ -323,17 +329,13 @@ class _LegacyRecordBatchBuilderPy(LegacyRecordBase):
                     "Not supported type for value: {}".format(type(value)))
             raise
 
-    def _encode_msg(self, start_pos, offset, timestamp, key, value,
-                    attributes=0):
+    def _encode_msg(self, start_pos, offset, timestamp, key, key_size, value,
+                    value_size, attributes=0):
         """ Encode msg data into the `msg_buffer`, which should be allocated
             to at least the size of this message.
         """
         magic = self._magic
         buf = self._buffer
-
-        # calculating length is not cheap; only do it once
-        key_size = len(key) if key is not None else 0
-        value_size = len(value) if value is not None else 0
 
         length = (
             self.KEY_LENGTH + key_size +
@@ -398,16 +400,17 @@ class _LegacyRecordBatchBuilderPy(LegacyRecordBase):
                     compressed = lz4_encode_old_kafka(bytes(self._buffer))
                 else:
                     compressed = lz4_encode(bytes(self._buffer))
-            size = self.size_in_bytes(
-                0, timestamp=0, key=None, value=compressed)
+            compressed_size = len(compressed)
+            size = self._size_in_bytes(
+                0, timestamp=0, key_size=0, value_size=compressed_size)
             if size > len(self._buffer):
                 self._buffer = bytearray(size)
             else:
                 del self._buffer[size:]
             self._encode_msg(
                 start_pos=0,
-                offset=0, timestamp=0, key=None, value=compressed,
-                attributes=self._compression_type)
+                offset=0, timestamp=0, key=None, key_size=0, value=compressed,
+                value_size=compressed_size, attributes=self._compression_type)
             return True
         return False
 
@@ -423,12 +426,21 @@ class _LegacyRecordBatchBuilderPy(LegacyRecordBase):
 
     # Size calculations. Just copied Java's implementation
 
-    def size_in_bytes(self, offset, timestamp, key, value, headers=None):
+    def _size_in_bytes(self, offset, timestamp, key_size, value_size):
         """ Actual size of message to add
         """
+        if self._magic == 0:
+            return (self.LOG_OVERHEAD + self.RECORD_OVERHEAD_V0 +
+                    key_size + value_size)
+        else:
+            return (self.LOG_OVERHEAD + self.RECORD_OVERHEAD_V1 +
+                    key_size + value_size)
+
+    def size_in_bytes(self, offset, timestamp, key, value, headers=None):
         assert not headers, "Headers not supported in v0/v1"
-        magic = self._magic
-        return self.LOG_OVERHEAD + self.record_size(magic, key, value)
+        key_size = len(key) if key is not None else 0
+        value_size = len(value) if value is not None else 0
+        return self._size_in_bytes(offset, timestamp, key_size, value_size)
 
     @classmethod
     def record_size(cls, magic, key, value):
