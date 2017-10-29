@@ -330,7 +330,8 @@ class _LegacyRecordBatchBuilderPy(LegacyRecordBase):
             raise
 
     def _encode_msg(self, start_pos, offset, timestamp, key, key_size, value,
-                    value_size, attributes=0):
+                    value_size, attributes=0,
+                    _struct_pack=struct.pack_into):
         """ Encode msg data into the `msg_buffer`, which should be allocated
             to at least the size of this message.
         """
@@ -345,7 +346,7 @@ class _LegacyRecordBatchBuilderPy(LegacyRecordBase):
 
         if magic == 0:
             length += self.KEY_OFFSET_V0
-            struct.pack_into(
+            _struct_pack(
                 ">q"   # BaseOffset => Int64
                 "i"    # Length => Int32
                 "I"    # CRC => Int32
@@ -364,7 +365,7 @@ class _LegacyRecordBatchBuilderPy(LegacyRecordBase):
                 value or b"")
         else:
             length += self.KEY_OFFSET_V1
-            struct.pack_into(
+            _struct_pack(
                 ">q"   # BaseOffset => Int64
                 "i"    # Length => Int32
                 "I"    # CRC => Int32
