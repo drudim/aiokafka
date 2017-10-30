@@ -7,9 +7,13 @@ from kafka.codec import (
 from aiokafka.errors import CorruptRecordException
 from zlib import crc32 as py_crc32  # needed for windows macro
 
-from cpython cimport PyObject_GetBuffer, PyBuffer_Release, PyBUF_WRITABLE, \
-                     PyBUF_SIMPLE, PyBUF_READ, Py_buffer, \
-                     PyBytes_FromStringAndSize
+from cpython.buffer cimport (
+    PyObject_GetBuffer, PyBuffer_Release, PyBUF_WRITABLE, PyBUF_SIMPLE,
+    PyBUF_READ, Py_buffer
+)
+from cpython.bytes cimport (
+    PyBytes_FromStringAndSize, PyBytes_GET_SIZE, PyBytes_AS_STRING
+)
 from libc.stdint cimport int32_t, int64_t, uint32_t
 from libc.string cimport memcpy
 cimport cython
@@ -365,6 +369,12 @@ cdef class _LegacyRecordBatchBuilderCython:
             LegacyRecordMetadata metadata
             uint32_t crc
 
+            Py_buffer py_buf
+            Py_ssize_t key_size
+            char *key_buf
+            Py_ssize_t value_size
+            char *value_buf
+
         if self._magic == 0:
             ts = -1
         elif timestamp is None:
@@ -372,9 +382,28 @@ cdef class _LegacyRecordBatchBuilderCython:
         else:
             ts = timestamp
 
+        # Extract key and value char pointer and size
+        if key is None:
+            key_size = 0
+            key_buf = NULL
+        else:
+            PyObject_GetBuffer(key, &py_buf, PyBUF_SIMPLE)
+            key_size = py_buf.len
+            key_buf = <char*> py_buf.buf
+            PyBuffer_Release(&py_buf)
+
+        if value is None:
+            value_size = 0
+            value_buf = NULL
+        else:
+            PyObject_GetBuffer(value, &py_buf, PyBUF_SIMPLE)
+            value_size = py_buf.len
+            value_buf = <char*> py_buf.buf
+            PyBuffer_Release(&py_buf)
+
         # Check if we have room for another message
         pos = PyByteArray_GET_SIZE(self._buffer)
-        size = _size_in_bytes(self._magic, key, value)
+        size = _size_in_bytes(self._magic, key_size, value_size)
         # We always allow at least one record to be appended
         if offset != 0 and pos + size >= self._batch_size:
             return None
@@ -386,7 +415,7 @@ cdef class _LegacyRecordBatchBuilderCython:
         buf = PyByteArray_AS_STRING(self._buffer)
         _encode_msg(
             self._magic, pos, buf,
-            offset, ts, key, value, 0, &crc)
+            offset, ts, key_buf, key_size, value_buf, value_size, 0, &crc)
 
         metadata = LegacyRecordMetadata.new(offset, crc, size, ts)
         return metadata
@@ -401,7 +430,26 @@ cdef class _LegacyRecordBatchBuilderCython:
     def size_in_bytes(self, offset, timestamp, key, value):
         """ Actual size of message to add
         """
-        return _size_in_bytes(self._magic, key, value)
+        cdef:
+            Py_buffer buf
+            Py_ssize_t key_len
+            Py_ssize_t value_len
+
+        if key is None:
+            key_len = 0
+        else:
+            PyObject_GetBuffer(key, &buf, PyBUF_SIMPLE)
+            key_len = buf.len
+            PyBuffer_Release(&buf)
+
+        if value is None:
+            value_len = 0
+        else:
+            PyObject_GetBuffer(value, &buf, PyBUF_SIMPLE)
+            value_len = buf.len
+            PyBuffer_Release(&buf)
+
+        return _size_in_bytes(self._magic, key_len, value_len)
 
     @staticmethod
     def record_overhead(char magic):
@@ -414,7 +462,9 @@ cdef class _LegacyRecordBatchBuilderCython:
         cdef:
             object compressed
             char *buf
+            char *compressed_buf
             Py_ssize_t size
+            Py_ssize_t compressed_size
             uint32_t crc
 
         if self._compression_type != 0:
@@ -429,14 +479,23 @@ cdef class _LegacyRecordBatchBuilderCython:
                     compressed = lz4_encode(bytes(self._buffer))
             else:
                 return 0
-            size = _size_in_bytes(self._magic, key=None, value=compressed)
+
+            compressed = bytes(compressed)
+            compressed_size = PyBytes_GET_SIZE(compressed)
+            compressed_buf = PyBytes_AS_STRING(compressed)
+
+            size = _size_in_bytes(
+                self._magic, key_len=0, value_len=compressed_size)
             # We will just write the result into the same memory space.
             PyByteArray_Resize(self._buffer, size)
+
 
             buf = PyByteArray_AS_STRING(self._buffer)
             _encode_msg(
                 self._magic, start_pos=0, buf=buf,
-                offset=0, timestamp=0, key=None, value=compressed,
+                offset=0, timestamp=0,
+                key_buf=NULL, key_size=0,
+                value_buf=compressed_buf, value_size=compressed_size,
                 attributes=self._compression_type, crc_out=&crc)
             return 1
         return 0
@@ -447,43 +506,26 @@ cdef class _LegacyRecordBatchBuilderCython:
         return self._buffer
 
 
-cdef Py_ssize_t _size_in_bytes(char magic, object key, object value) except -1:
+cdef inline Py_ssize_t _size_in_bytes(
+        char magic, Py_ssize_t key_len, Py_ssize_t value_len) except -1:
     """ Actual size of message to add
     """
-    cdef:
-        Py_buffer buf
-        Py_ssize_t key_len
-        Py_ssize_t value_len
-
-    if key is None:
-        key_len = 0
-    else:
-        PyObject_GetBuffer(key, &buf, PyBUF_SIMPLE)
-        key_len = buf.len
-        PyBuffer_Release(&buf)
-
-    if value is None:
-        value_len = 0
-    else:
-        PyObject_GetBuffer(value, &buf, PyBUF_SIMPLE)
-        value_len = buf.len
-        PyBuffer_Release(&buf)
-
     if magic == 0:
         return LOG_OVERHEAD + RECORD_OVERHEAD_V0_DEF + key_len + value_len
     else:
         return LOG_OVERHEAD + RECORD_OVERHEAD_V1_DEF + key_len + value_len
 
 
-cdef int _encode_msg(
+cdef inline int _encode_msg(
         char magic, Py_ssize_t start_pos, char *buf,
-        int64_t offset, int64_t timestamp, object key, object value,
+        int64_t offset, int64_t timestamp,
+        char* key_buf, Py_ssize_t key_size,
+        char* value_buf, Py_ssize_t value_size,
         char attributes, uint32_t* crc_out) except -1:
     """ Encode msg data into the `msg_buffer`, which should be allocated
         to at least the size of this message.
     """
     cdef:
-        Py_buffer key_val_buf
         Py_ssize_t pos = start_pos
         int32_t length
         unsigned long crc = 0
@@ -491,27 +533,23 @@ cdef int _encode_msg(
     # Write key and value
     pos += KEY_OFFSET_V0 if magic == 0 else KEY_OFFSET_V1
 
-    if key is None:
+    if key_buf == NULL:
         hton.pack_int32(&buf[pos], -1)
         pos += KEY_LENGTH
     else:
-        PyObject_GetBuffer(key, &key_val_buf, PyBUF_SIMPLE)
-        hton.pack_int32(&buf[pos], <int32_t>key_val_buf.len)
+        hton.pack_int32(&buf[pos], <int32_t> key_size)
         pos += KEY_LENGTH
-        memcpy(&buf[pos], <char*>key_val_buf.buf, <size_t>key_val_buf.len)
-        pos += key_val_buf.len
-        PyBuffer_Release(&key_val_buf)
+        memcpy(&buf[pos], key_buf, <size_t> key_size)
+        pos += key_size
 
-    if value is None:
+    if value_buf == NULL:
         hton.pack_int32(&buf[pos], -1)
         pos += VALUE_LENGTH
     else:
-        PyObject_GetBuffer(value, &key_val_buf, PyBUF_SIMPLE)
-        hton.pack_int32(&buf[pos], <int32_t>key_val_buf.len)
+        hton.pack_int32(&buf[pos], <int32_t> value_size)
         pos += VALUE_LENGTH
-        memcpy(&buf[pos], <char*>key_val_buf.buf, <size_t>key_val_buf.len)
-        pos += key_val_buf.len
-        PyBuffer_Release(&key_val_buf)
+        memcpy(&buf[pos], value_buf, <size_t> value_size)
+        pos += value_size
     length = <int32_t> ((pos - start_pos) - LOG_OVERHEAD)
 
     # Write msg header. Note, that Crc should be updated last
